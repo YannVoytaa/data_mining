@@ -1,0 +1,347 @@
+```{r setup, results=FALSE, message = FALSE}
+options(width = 120)
+library(data.table)
+library(hash)
+library(plotly)
+library(arules)
+```
+
+### Reading data:
+
+```{r message = FALSE}
+cards = fread(cmd = '7z e -so "jan_2019_games_arenas_1_to_13.7z"', header=TRUE)
+```
+
+### Transforming decks to lists and adding winner_deck information:
+
+```{r}
+cards$player_deck_list <- strsplit(cards$player_deck, "_")
+cards$opp_deck_list <- strsplit(cards$opp_deck, "_")
+cards[, winner_deck_list := ifelse(has_won, player_deck_list, opp_deck_list)]
+head(cards, 1000)
+```
+
+### Util function for apriori algorithm- takes frequent itemsets of size N and generates candidate itemsets of size N+1:
+
+```{r message = FALSE}
+createCandidates <- function(prevCandidates) {
+  if (length(prevCandidates) == 0) {
+    return(list())
+  }
+  n <- length(prevCandidates[[1]])
+  
+  result <- list()
+  
+  for (i in 1:length(prevCandidates)) {
+    for (j in i:length(prevCandidates)) {
+      if ((n == 1 || identical(prevCandidates[[i]][1:(n-1)], prevCandidates[[j]][1:(n-1)])) &&
+          as.character(prevCandidates[[i]][n]) != as.character(prevCandidates[[j]][n])) {
+        new_list <- c(prevCandidates[[i]], prevCandidates[[j]][n])
+        result[[length(result)+1]] <- new_list
+      }
+      else if (n != 1 && !identical(prevCandidates[[i]][1:(n-1)], prevCandidates[[j]][1:(n-1)])) {
+        break
+      }
+    }
+  }
+  
+  result
+}
+
+```
+
+### Apriori algorithm (hybrid solution- one approach is faster and more memory-efficient for smaller sizes, one for bigger sizes (and smaller amount of candidates)):
+
+```{r message = FALSE}
+DECK_SIZE=8
+HYBRID_SOLUTION_SIZE_THRESHOLD = 4 # the solution is too demanding in terms of time without hybrid solution
+apriori <- function(df, support) {
+  n <- 2 * nrow(df)
+  player_deck_counts <- table(unlist(c(df$player_deck_list, df$opp_deck_list)))
+  winner_deck_counts <- table(unlist(df$winner_deck_list))
+  player_deck_counts_filtered <- player_deck_counts[player_deck_counts >= n * support]
+  curFreqSet <- lapply(names(player_deck_counts_filtered), function(card) list(card))
+  res <- mapply(function(x, y) c(itemset = list(x), pick_ratio = y / n, win_ratio = ifelse(is.na(winner_deck_counts[x][[1]]), 0, winner_deck_counts[x][[1]]) / y, size=1, name=x), names(player_deck_counts_filtered), as.list(player_deck_counts_filtered), SIMPLIFY = FALSE)
+  for (size in 2:HYBRID_SOLUTION_SIZE_THRESHOLD) {
+    cands = createCandidates(curFreqSet)
+    cand_counts <- hash()
+    winner_counts <- hash()
+    for (cand in cands) {
+      name <- paste(cand, collapse=", ")
+      cand_counts[[name]] <- 0
+      winner_counts[[name]] <- 0
+    }
+    lapply(combn(1:DECK_SIZE, size, simplify = FALSE), function(comb) {
+      player_counts_on_pos <- table(sapply(df$player_deck_list, function(lst) paste(lst[comb], collapse = ", ")))
+      opp_counts_on_pos <- table(sapply(df$opp_deck_list, function(lst) paste(lst[comb], collapse = ", ")))
+      winner_counts_on_pos <- table(sapply(df$winner_deck_list, function(lst) paste(lst[comb], collapse = ", ")))
+      lapply(names(player_counts_on_pos), function(name) {
+        if(exists(name, cand_counts)) {
+          cand_counts[[name]] <- cand_counts[[name]] + player_counts_on_pos[[name]]
+        }
+      })
+      lapply(names(opp_counts_on_pos), function(name) {
+        if(exists(name, cand_counts)) {
+          cand_counts[[name]] <- cand_counts[[name]] + opp_counts_on_pos[[name]]
+        }
+      })
+      lapply(names(winner_counts_on_pos), function(name) {
+        if(exists(name, winner_counts)) {
+          winner_counts[[name]] <- winner_counts[[name]] + winner_counts_on_pos[[name]]
+        }
+      })
+    })
+    curFreqSet <- lapply(names(cand_counts), function(name) {
+      picks <- cand_counts[[name]]
+      wins <- if (exists(name, winner_counts)) winner_counts[[name]] else 0
+      if (picks >= n * support) {
+        lst <- unlist(strsplit(name, ", "))
+        newSet <- list(itemset = lst, pick_ratio = picks / n, win_ratio = wins / picks, size = length(lst), name=name)
+        return(newSet)
+      }
+      else {
+        return(NULL)
+      }
+    })
+    curFreqSet <- curFreqSet[lengths(curFreqSet) > 0]
+    res <- c(res, curFreqSet)
+    curFreqSet <- lapply(curFreqSet, function(x) x$itemset)
+  }
+  for (size in (HYBRID_SOLUTION_SIZE_THRESHOLD+1):DECK_SIZE) {
+    cands = createCandidates(curFreqSet)
+    curFreqSet <- lapply(cands, function(lst) {
+      rows <- sum(colSums(sapply(df$player_deck_list, function(deck) lst %in% deck)) == length(lst)) + sum(colSums(sapply(df$opp_deck_list, function(deck) lst %in% deck)) == length(lst))
+      if (rows >= support * n) {
+        rows_won <- sum(colSums(sapply(df$winner_deck_list, function(deck) lst %in% deck)) == length(lst))
+        return(list(itemset = lst, pick_ratio = rows / n, win_ratio = rows_won / rows, size = length(lst), name=paste(lst, collapse=", ")))
+      } else {
+        return(NULL)
+      }
+    })
+    curFreqSet <- curFreqSet[lengths(curFreqSet) > 0]
+    res <- c(res, curFreqSet)
+    curFreqSet <- lapply(curFreqSet, function(x) x$itemset)
+  }
+  res
+}
+```
+
+```{r message = FALSE}
+aprioriToDt <- function(aprioriRes) {
+  res <- rbindlist(lapply(aprioriRes, function(el) {
+    el$itemset <- el$name
+    el
+  }))
+  res[, itemset:= sapply(res$name, function(name) strsplit(name, ", "))]   # rbindlist doesn't transform non-atomic values
+  res
+}
+```
+
+### Faster implementation- using external library 'arules':
+
+```{r message = FALSE}
+findFreqItems <- function(df, support) {
+  transactions <- as(c(df$player_deck_list, df$opp_deck_list), "transactions")
+  frequent_itemsets <- eclat(transactions, parameter = list(support = support))
+  res <- data.table(as(frequent_itemsets, "data.frame"))
+  res$itemset <- lapply(strsplit(gsub("[{}]", "", res$items), ",\\s*"), as.character)
+  res$pick_ratio <- res$support
+  res$size <- sapply(res$itemset, function(items) length(items))
+  res$name <- sapply(res$itemset, function(items) paste(items, collapse = ", "))
+  res$items <- NULL
+  res$support <- NULL
+  res$count <- NULL
+  
+  wins_transactions <- as(df$winner_deck_list, "transactions")
+  winning_itemsets <- eclat(wins_transactions, parameter = list(support = 0.001))
+  winners <- data.table(as(winning_itemsets, "data.frame"))
+  winners$name <- sapply(lapply(strsplit(gsub("[{}]", "", winners$items), ",\\s*"), as.character), function(items) paste(items, collapse = ", "))
+  winners$wins <- winners$count
+  winners$items <- NULL
+  winners$support <- NULL
+  winners$count <- NULL
+
+  res_with_wins <- merge(res, winners, by = "name", all.x = TRUE)
+  res_with_wins$wins <- ifelse(is.na(res_with_wins$wins), 0, res_with_wins$wins)
+  n <- 2 * nrow(df)
+  res_with_wins$win_ratio <- res_with_wins$wins / res_with_wins$pick_ratio / n
+  res_with_wins
+}
+```
+
+
+
+```{r message = FALSE, results = FALSE}
+SUPPORT = 0.01
+freqItemsDt = findFreqItems(cards, SUPPORT)
+```
+```{r}
+head(freqItemsDt, 1000)
+```
+
+### Util functions to generate plots and one function to take 100 most frequent itemsets for each size:
+
+```{r message = FALSE}
+createTop100 <- function(freqItemsDt, df) {
+  n <- 2 * nrow(df)
+  top100 <- freqItemsDt[order(-pick_ratio), .SD[1:100], by=size]
+  top100 <- top100[pick_ratio > 0] # filtering NA's
+  top100
+}
+
+genPickRatioPlot <- function(df) {
+  plot_ly(df, x=~factor(name,levels = unique(name[order(size, -pick_ratio)])), y=~pick_ratio, color=~factor(size, levels = unique(size)), hovertemplate="Itemset: %{x}<br>Pick Ratio: %{y}<br>", type="bar") %>% layout(xaxis = list(title="Itemset", showticklabels = FALSE), yaxis = list(title="Pick Ratio")) %>% layout(title="Pick Ratio by Itemset")
+}
+
+genAnimatedPickRatioPlot <- function(df, frame) {
+  plot_ly(df, x=~factor(name,levels = unique(name[order(size, -pick_ratio)])), y=~pick_ratio, color=~factor(size, levels = unique(size)), frame=frame, hovertemplate="Itemset: %{x}<br>Pick Ratio: %{y}<br>", type="bar") %>% layout(xaxis = list(title="Itemset", showticklabels = FALSE), yaxis = list(title="Pick Ratio")) %>% layout(title="Pick Ratio by Itemset")  %>%
+    animation_opts(
+      500, redraw = FALSE
+    )
+}
+
+genWinRatioPlot <- function(df) {
+  plot_ly(df, x=~factor(name,levels = unique(name[order(size, -win_ratio)])), y=~win_ratio, color=~factor(size, levels = unique(size)), hovertemplate="Itemset: %{x}<br>Win Ratio: %{y}<br>", type="bar") %>% layout(xaxis = list(title="Itemset", showticklabels = FALSE), yaxis = list(title="Win Ratio")) %>% layout(title="Win Ratio by Itemset")
+}
+
+genAnimatedWinRatioPlot <- function(df, frame) {
+  plot_ly(df, x=~factor(name,levels = unique(name[order(size, -win_ratio)])), y=~win_ratio, color=~factor(size, levels = unique(size)), frame=frame, hovertemplate="Itemset: %{x}<br>Win Ratio: %{y}<br>", type="bar") %>% layout(xaxis = list(title="Itemset", showticklabels = FALSE), yaxis = list(title="Win Ratio")) %>% layout(title="Win Ratio by Itemset")  %>%
+    animation_opts(
+      500, redraw = FALSE
+    )
+}
+```
+
+```{r message = FALSE}
+top100 <- createTop100(freqItemsDt, cards)
+```
+
+### Pick ratio/Win ratio based on arena:
+
+```{r}
+genPickRatioPlot(top100)
+```
+```{r}
+genWinRatioPlot(top100)
+```
+```{r message = FALSE, results = FALSE}
+freqItemsByArena <- lapply(unique(cards$arena_id), function(arenaId) {
+  fromArena <- cards[arena_id == arenaId]
+  freqFromArenaDt <- findFreqItems(fromArena, SUPPORT)
+  freqFromArenaDt[, arena_id := arenaId]
+  top100Arenas <- createTop100(freqFromArenaDt, fromArena)
+  top100Arenas
+})
+freqItemsByArena <- rbindlist(freqItemsByArena)
+```
+```{r}
+genAnimatedPickRatioPlot(freqItemsByArena, ~arena_id)
+```
+```{r}
+genAnimatedWinRatioPlot(freqItemsByArena, ~arena_id)
+```
+
+### Pick ratio/Win ratio based on day:
+
+```{r message = FALSE, results = FALSE}
+cards$day <- as.Date(cards$timestamp)
+freqItemsByDay <- lapply(unique(cards$day), function(dayId) {
+  fromDay <- cards[day == dayId]
+  freqFromDayDt <- findFreqItems(fromDay, SUPPORT)
+  freqFromDayDt[, day := as.character(dayId)]
+  top100Days <- createTop100(freqFromDayDt, fromDay)
+  top100Days
+})
+freqItemsByDay <- rbindlist(freqItemsByDay)
+```
+```{r}
+genAnimatedPickRatioPlot(freqItemsByDay, ~day)
+```
+```{r}
+genAnimatedWinRatioPlot(freqItemsByDay, ~day)
+```
+
+### Finding associactions between cards:
+
+```{r}
+findAssociacions <- function(cur_itemset, candidates, support) {
+  item_pick_ratio = cur_itemset$pick_ratio
+  max_pick_ratio = item_pick_ratio / support # support(cand => itemset) = item_pick_ratio / cand_pick_ratio >= support
+  candidates = candidates[pick_ratio <= max_pick_ratio]
+  cur_items <- cur_itemset$itemset
+  candidates_subsets <- candidates[sapply(itemset, function(items) all(items %in% cur_items) && !all(cur_items %in% items))]
+  mapply(function(pick_ratio, name, items) list(left_side_pick_ratio=pick_ratio, left_side=name, right_side=toString(setdiff(cur_items, items)), right_side_support=item_pick_ratio / pick_ratio), candidates_subsets$pick_ratio, candidates_subsets$name, candidates_subsets$itemset, SIMPLIFY = FALSE)
+}
+x <- apply(top100, MARGIN=1, function(itemset) findAssociacions(itemset, freqItemsDt, 0.33))
+result <- list()
+for (res_list in x) {
+  result <- c(result, res_list)
+}
+result <- rbindlist(result)
+head(result[order(right_side_support, decreasing = TRUE)], 1000)
+```
+
+```{r}
+hover_text <- paste(
+  "<b>Left Side:</b> ", result$left_side, "<br>",
+  "<b>Left Side Pick Ratio:</b> ", result$left_side_pick_ratio, "<br>",
+  "<b>Right Side:</b> ", result$right_side, "<br>",
+  "<b>Right Side Support:</b> ", result$right_side_support, "<br>"
+)
+
+plot_ly(result, x = ~left_side_pick_ratio, y = ~right_side_support, type = "scatter", mode = "markers", 
+        hovertemplate = hover_text, marker = list(size = 10, color = "blue"))
+
+```
+
+### Creating recommendation table- it stores information about how many times each user played each card in his history:
+
+```{r}
+exploded <- cards[, .(tag, card = unlist(player_deck_list)), by = seq_len(nrow(cards))]
+usage <- dcast(exploded, tag ~ card, fun.aggregate = length)
+head(usage)
+```
+
+Performing SVD decomposition on recommendation table:
+  
+```{r message = FALSE}
+usage_matrix <- as.matrix(usage[, -1])
+
+svd_res <- svd(usage_matrix)
+
+U <- svd_res$u
+S <- diag(svd_res$d)
+V <- svd_res$v
+```
+
+Grouping players based on the most dominant concept:
+  
+```{r message = FALSE}
+K = ceiling(nrow(S) / 2)
+U <- U[1:K, ]
+S <- S[1:K, 1:K]
+V <- V[, 1:K]
+groups <- max.col(apply(U, c(1,2), abs))
+user_concept <- head(data.table(userId = usage$tag, cluster_number = groups), 1000)
+```
+```{r}
+plot_ly(user_concept, x=~userId, y=~cluster_number, type = "scatter", color=~cluster_number) %>%
+  layout(xaxis = list(categoryorder = "total ascending"))
+```
+
+### Recommendation system: based on provided 4 cards- we calculate preferences regarding the concepts, which then allow us to calculate cards preferences; then we need to remove our 4 cards from the list and take 4 with the highest values
+
+```{r}
+cards_number = nrow(V)
+create_remcommendations <- function(chosen_cards) {
+  chosen_cards_idxs <- sapply(chosen_cards, function(card) which(names(usage) == card))
+  preferences <- rep(0, cards_number)
+  preferences[chosen_cards_idxs] <- 1
+  concept_preferences <- preferences %*% V
+  preference_prediction <- concept_preferences %*% t(V)
+  preference_prediction <- apply(preference_prediction, c(1,2), abs)
+  names(preference_prediction) <- colnames(usage)[-1] # cut 'tag' colname
+  setdiff(names(sort(preference_prediction, decreasing = TRUE)), chosen_cards)[1:4]
+}
+create_remcommendations(c("balloon", "baby-dragon", "archers", "arrows"))
+```
